@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+WSL Disk Analyzer
+
+Usage:
+  wsl-disk                 Show report for current distro
+  wsl-disk --distro NAME  Show report for a specific distro
+
+  wsl-disk reclaim        Reclaim unused space (may trigger UAC)
+  wsl-disk reclaim --distro NAME
+  wsl-disk reclaim --yes  Non-interactive reclaim for current distro
+
+Commands:
+  (default)  report  Show Linux used, VHDX size, and wasted space
+  reclaim            Shutdown WSL, Optimize-VHD Full, and restart
+EOF
+}
+
+distro="${WSL_DISTRO_NAME:-}"
+subcmd="report"
+yes_flag="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --distro)
+      distro="${2:-}"
+      shift 2
+      ;;
+    reclaim)
+      subcmd="reclaim"
+      shift
+      ;;
+    --yes)
+      yes_flag="true"
+      shift
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$distro" ]]; then
+  echo "Could not determine distro name. Try: wsl-disk --distro <NAME>" >&2
+  exit 2
+fi
+
+bytes_to_gb() {
+  # Input: bytes
+  awk -v b="$1" 'BEGIN { printf "%.1f", b/1024/1024/1024 }'
+}
+
+linux_used_bytes() {
+  # Uses the root filesystem's 'used' block count.
+  # df behavior varies slightly by distro; -k is broadly supported.
+  local used_kb
+  used_kb="$(df --output=used -k / | awk 'NR==2{print $1}')"
+  if [[ -z "${used_kb}" ]]; then
+    echo "Failed to read Linux disk usage via df." >&2
+    exit 1
+  fi
+  awk -v kb="$used_kb" 'BEGIN{ printf "%.0f", kb*1024 }'
+}
+
+pwsh_get_vhdx_info_json() {
+  # Output: JSON with VhdxPath and VhdxSizeBytes
+  local ps
+  ps='param([string]$DistroName)
+$ErrorActionPreference = "Stop"
+
+$DistroName = $DistroName.Trim()
+# Normalize names like "Ubuntu-22.04" -> "Ubuntu" (common when the registry stores without the version suffix)
+$DistroNameNorm = ($DistroName -replace "-\d+\.\d+.*$","").Trim()
+
+$roots = @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss","HKLM:\Software\Microsoft\Windows\CurrentVersion\Lxss")
+$match = $null
+
+foreach ($root in $roots) {
+  if (-not (Test-Path $root)) { continue }
+
+  $candidates = @(Get-ChildItem $root | ForEach-Object {
+    $p = Get-ItemProperty $_.PsPath
+    [pscustomobject]@{
+      DistributionName = $p.DistributionName
+      BasePath         = $p.BasePath
+      Key              = $_.PSChildName
+    }
+  } | Where-Object { $_.DistributionName -ieq $DistroName })
+
+  if ($candidates.Count -eq 0) {
+    $candidates = @(Get-ChildItem $root | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath
+      [pscustomobject]@{
+        DistributionName = $p.DistributionName
+        BasePath         = $p.BasePath
+        Key              = $_.PSChildName
+      }
+    } | Where-Object { $_.DistributionName -ieq $DistroNameNorm })
+  }
+
+  if ($candidates.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($DistroNameNorm)) {
+    $candidates = @(Get-ChildItem $root | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath
+      [pscustomobject]@{
+        DistributionName = $p.DistributionName
+        BasePath         = $p.BasePath
+        Key              = $_.PSChildName
+      }
+    } | Where-Object { $_.DistributionName -like ("*" + $DistroNameNorm + "*") })
+  }
+
+  if ($candidates.Count -gt 0) {
+    $match = $candidates | Select-Object -First 1
+    break
+  }
+}
+
+if (-not $match) {
+  throw ("Could not find VHDX mapping for distro " + $DistroName + ".")
+}
+
+$vhdx = $null
+if ($match.BasePath -and (Test-Path $match.BasePath)) {
+  $vhdx = Get-ChildItem -Path $match.BasePath -Filter "*.vhdx" -File -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+}
+
+if (-not $vhdx) {
+  throw ("No .vhdx found under BasePath " + $match.BasePath + ".")
+}
+
+[pscustomobject]@{
+  DistributionName = $match.DistributionName
+  BasePath         = $match.BasePath
+  VhdxPath         = $vhdx.FullName
+  VhdxSizeBytes    = $vhdx.Length
+} | ConvertTo-Json -Compress'
+
+  powershell.exe -NoProfile -Command "& { $ps }" "$distro"
+}
+
+pwsh_optimize_vhd_for_distro() {
+  local ps
+  ps='param([string]$DistroName)
+$ErrorActionPreference = "Stop"
+
+$DistroName = $DistroName.Trim()
+$DistroNameNorm = ($DistroName -replace "-\d+\.\d+.*$","").Trim()
+
+$roots = @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss","HKLM:\Software\Microsoft\Windows\CurrentVersion\Lxss")
+$match = $null
+
+foreach ($root in $roots) {
+  if (-not (Test-Path $root)) { continue }
+
+  $candidates = @(Get-ChildItem $root | ForEach-Object {
+    $p = Get-ItemProperty $_.PsPath
+    [pscustomobject]@{
+      DistributionName = $p.DistributionName
+      BasePath         = $p.BasePath
+      Key              = $_.PSChildName
+    }
+  } | Where-Object { $_.DistributionName -ieq $DistroName })
+
+  if ($candidates.Count -eq 0) {
+    $candidates = @(Get-ChildItem $root | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath
+      [pscustomobject]@{
+        DistributionName = $p.DistributionName
+        BasePath         = $p.BasePath
+        Key              = $_.PSChildName
+      }
+    } | Where-Object { $_.DistributionName -ieq $DistroNameNorm })
+  }
+
+  if ($candidates.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($DistroNameNorm)) {
+    $candidates = @(Get-ChildItem $root | ForEach-Object {
+      $p = Get-ItemProperty $_.PsPath
+      [pscustomobject]@{
+        DistributionName = $p.DistributionName
+        BasePath         = $p.BasePath
+        Key              = $_.PSChildName
+      }
+    } | Where-Object { $_.DistributionName -like ("*" + $DistroNameNorm + "*") })
+  }
+
+  if ($candidates.Count -gt 0) {
+    $match = $candidates | Select-Object -First 1
+    break
+  }
+}
+
+if (-not $match) {
+  throw ("Could not find VHDX mapping for distro " + $DistroName + ".")
+}
+
+$vhdx = $null
+if ($match.BasePath -and (Test-Path $match.BasePath)) {
+  $vhdx = Get-ChildItem -Path $match.BasePath -Filter "*.vhdx" -File -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+}
+
+if (-not $vhdx) {
+  throw ("No .vhdx found under BasePath " + $match.BasePath + ".")
+}
+
+if (-not (Get-Command Optimize-VHD -ErrorAction SilentlyContinue)) {
+  throw "Optimize-VHD was not found. Enable Hyper-V management tools on Windows."
+}
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+  throw "Windows Administrator privileges are required for Optimize-VHD. Start WSL from an elevated (Run as administrator) Windows terminal, then retry."
+}
+
+Optimize-VHD -Path $vhdx.FullName -Mode Full'
+
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { $ps }" "$distro"
+}
+
+pwsh_is_windows_admin() {
+  # Outputs: 1 if current user is Windows Administrator, else 0.
+  powershell.exe -NoProfile -Command '$ErrorActionPreference="Stop"; $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); if($isAdmin){ "1" } else { "0" }'
+}
+
+case "$subcmd" in
+  report)
+    linux_used_b="$(linux_used_bytes)"
+    vhdx_json="$(pwsh_get_vhdx_info_json)"
+
+    # Extract fields robustly (no `jq` dependency).
+    vhdx_path="$(printf "%s" "$vhdx_json" | python3 -c 'import json,sys; j=json.loads(sys.stdin.read()); print(j.get("VhdxPath",""))')"
+    vhdx_size_bytes="$(printf "%s" "$vhdx_json" | python3 -c 'import json,sys; j=json.loads(sys.stdin.read()); print(j.get("VhdxSizeBytes",""))')"
+
+    if [[ -z "$vhdx_size_bytes" || ! "$vhdx_size_bytes" =~ ^[0-9]+$ ]]; then
+      echo "Failed to parse VHDX size from PowerShell output." >&2
+      echo "Raw: $vhdx_json" >&2
+      exit 1
+    fi
+
+    wasted_bytes="$(( vhdx_size_bytes > linux_used_b ? vhdx_size_bytes - linux_used_b : 0 ))"
+
+    linux_gb="$(bytes_to_gb "$linux_used_b")"
+    vhdx_gb="$(bytes_to_gb "$vhdx_size_bytes")"
+    wasted_gb="$(bytes_to_gb "$wasted_bytes")"
+
+    status="OK"
+    tip=""
+    warning_marker=""
+    if awk -v w="$wasted_bytes" 'BEGIN{exit !(w > 5*1024*1024*1024)}'; then
+      status="Needs reclaim"
+      warning_marker=" (STRONG WARNING)"
+      tip="Strong warning: run wsl-disk reclaim"
+    elif awk -v w="$wasted_bytes" 'BEGIN{exit !(w > 1*1024*1024*1024)}'; then
+      status="Needs reclaim"
+      warning_marker=" (WARNING)"
+      tip="Warning: run wsl-disk reclaim"
+    else
+      tip="Tip: if you recently deleted a lot, try wsl-disk reclaim anyway."
+    fi
+
+    cat <<EOF
+WSL Disk Report
+-------------------------
+Distro: $distro
+
+Linux usage:        ${linux_gb} GB
+VHDX size:          ${vhdx_gb} GB
+Wasted space:      ${wasted_gb} GB${warning_marker}
+
+Status: ${status}
+Tip: $tip
+EOF
+    ;;
+
+  reclaim)
+    linux_used_b="$(linux_used_bytes)"
+    vhdx_json="$(pwsh_get_vhdx_info_json)"
+    vhdx_size_bytes="$(printf "%s" "$vhdx_json" | python3 -c 'import json,sys; j=json.loads(sys.stdin.read()); print(j.get("VhdxSizeBytes",""))')"
+    wasted_bytes="$(( vhdx_size_bytes > linux_used_b ? vhdx_size_bytes - linux_used_b : 0 ))"
+
+    wasted_gb="$(bytes_to_gb "$wasted_bytes")"
+    vhdx_gb="$(bytes_to_gb "$vhdx_size_bytes")"
+
+    echo "Reclaim requested for distro: $distro"
+    echo "Estimated wasted space: ${wasted_gb} GB (VHDX size: ${vhdx_gb} GB)"
+
+    if [[ "$(pwsh_is_windows_admin)" != "1" ]]; then
+      echo "Cannot run reclaim: Windows Administrator privileges are required for Optimize-VHD."
+      echo "Start WSL from an elevated terminal on Windows (Run as administrator), then retry:"
+      echo "  wsl-disk reclaim --distro \"$distro\""
+      exit 1
+    fi
+
+    if [[ "$yes_flag" != "true" ]]; then
+      read -r -p "Proceed? This will shutdown WSL and may ask for Windows admin approval [y/N]: " ans || ans="N"
+      if [[ "${ans:-N}" != "y" && "${ans:-N}" != "Y" ]]; then
+        echo "Cancelled."
+        exit 0
+      fi
+    fi
+
+    echo "Shutting down WSL..."
+    wsl.exe --shutdown
+
+    echo "Optimizing VHDX (Optimize-VHD -Mode Full)..."
+    pwsh_optimize_vhd_for_distro
+
+    echo "Restarting WSL..."
+    # Start the target distro to re-mount the filesystem.
+    wsl.exe -d "$distro" -- bash -lc "true" >/dev/null 2>&1 || true
+
+    echo "Done. Re-run wsl-disk to see the updated report."
+    ;;
+
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
