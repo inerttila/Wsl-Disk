@@ -2,24 +2,14 @@
 
 WSL Disk Analyzer: compares Linux filesystem usage vs the underlying WSL2 VHDX file size, then (optionally) reclaims wasted space via `Optimize-VHD`.
 
-## Install
+## Install from GitHub Release
 
-From inside WSL:
-
-```bash
-chmod +x ./install.sh
-sudo ./install.sh
-```
-
-After that:
+Download the `.deb` from the repository’s **Releases** page, then run:
 
 ```bash
-wsl-disk
+sudo apt update
+sudo apt install -y ./wsl-disk_0.1.0_all.deb
 ```
-
-## Usage
-
-Show report for the current distro:
 
 ```bash
 wsl-disk
@@ -48,4 +38,3 @@ wsl-disk reclaim --yes
 - Reclaim uses Windows `Optimize-VHD -Mode Full`, which generally requires Windows admin approval (UAC).
 - Distro-to-VHDX mapping uses the Windows registry `...\Lxss` keys.
 - This MVP compares `df` root filesystem usage to the VHDX file length. It works well in practice, but it’s not an exact block-level model.
-
