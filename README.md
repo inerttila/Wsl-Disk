@@ -15,6 +15,21 @@ sudo apt install -y ./wsl-disk_0.1.0_all.deb
 wsl-disk
 ```
 
+Example output:
+
+```bash
+WSL Disk Report
+-------------------------
+Distro: Ubuntu
+
+Linux usage:        2.8 GB
+VHDX size:          4.1 GB
+Wasted space:      1.3 GB (WARNING)
+
+Status: Needs reclaim
+Tip: Warning: run wsl-disk reclaim
+```
+
 Show report for a specific distro:
 
 ```bash
@@ -38,3 +53,4 @@ wsl-disk reclaim --yes
 - Reclaim uses Windows `Optimize-VHD -Mode Full`, which generally requires Windows admin approval (UAC).
 - Distro-to-VHDX mapping uses the Windows registry `...\Lxss` keys.
 - This MVP compares `df` root filesystem usage to the VHDX file length. It works well in practice, but it’s not an exact block-level model.
+****
